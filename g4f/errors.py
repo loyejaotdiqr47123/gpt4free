@@ -1,26 +1,47 @@
 class ProviderNotFoundError(Exception):
-    pass
+    ...
 
 class ProviderNotWorkingError(Exception):
-    pass
+    ...
 
 class StreamNotSupportedError(Exception):
-    pass
-
-class AuthenticationRequiredError(Exception):
-    pass
+    ...
 
 class ModelNotFoundError(Exception):
-    pass
+    ...
 
-class ModelNotAllowed(Exception):
-    pass
+class ModelNotAllowedError(Exception):
+    ...
 
 class RetryProviderError(Exception):
-    pass
+    ...
 
 class RetryNoProviderError(Exception):
-    pass
+    ...
 
 class VersionNotFoundError(Exception):
-    pass
+    ...
+
+class ModelNotSupportedError(Exception):
+    ...
+
+class MissingRequirementsError(Exception):
+    ...
+
+class NestAsyncioError(MissingRequirementsError):
+    ...
+
+class MissingAuthError(Exception):
+    ...
+
+class NoImageResponseError(Exception):
+    ...
+
+class RateLimitError(Exception):
+    ...
+
+class ResponseError(Exception):
+    ...
+
+class ResponseStatusError(Exception):
+    ...

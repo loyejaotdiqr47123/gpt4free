@@ -8,10 +8,78 @@ here = os.path.abspath(os.path.dirname(__file__))
 with codecs.open(os.path.join(here, 'README.md'), encoding='utf-8') as fh:
     long_description = '\n' + fh.read()
 
-with open('requirements.txt') as f:
-    required = f.read().splitlines()
+INSTALL_REQUIRE = [
+    "requests",
+    "aiohttp",
+    "brotli",
+    "pycryptodome"
+]
 
-VERSION = '0.1.9.7'
+EXTRA_REQUIRE = {
+    'all': [
+        "curl_cffi>=0.6.2",
+        "certifi",
+        "browser_cookie3",         # get_cookies
+        "PyExecJS",                # GptForLove, Vercel
+        "duckduckgo-search>=5.0"  ,# internet.search
+        "beautifulsoup4",          # internet.search and bing.create_images
+        "brotli",                  # openai, bing
+        # webdriver
+        #"undetected-chromedriver>=3.5.5",
+        #"setuptools", 
+        #"selenium-wire"
+        # webview
+        "pywebview",
+        "platformdirs",
+        "plyer",
+        "cryptography",
+        ####
+        "aiohttp_socks",           # proxy
+        "pillow",                  # image
+        "cairosvg",                # svg image
+        "werkzeug", "flask",       # gui
+        "loguru", "fastapi",       # api
+        "uvicorn", "nest_asyncio", # api
+        "pycryptodome"             # openai
+    ],
+    "image": [
+        "pillow",
+        "cairosvg",
+        "beautifulsoup4"
+    ],
+    "webdriver": [
+        "platformdirs",
+        "undetected-chromedriver>=3.5.5",
+        "setuptools",
+        "selenium-wire"
+    ],
+    "webview": [
+        "webview",
+        "platformdirs",
+        "plyer",
+        "cryptography"
+    ],
+    "openai": [
+        "pycryptodome"
+    ],
+    "api": [
+        "loguru", "fastapi",
+        "uvicorn", "nest_asyncio"
+    ],
+    "gui": [
+        "werkzeug", "flask",
+        "beautifulsoup4", "pillow",
+        "duckduckgo-search>=5.0",
+        "browser_cookie3"
+    ],
+    "local": [
+        "gpt4all"
+    ],
+    "curl_cffi": [
+        "curl_cffi>=0.6.2",
+    ]
+}
+
 DESCRIPTION = (
     'The official gpt4free repository | various collection of powerful language models'
 )
@@ -19,7 +87,7 @@ DESCRIPTION = (
 # Setting up
 setup(
     name='g4f',
-    version=VERSION,
+    version=os.environ.get("G4F_VERSION"),
     author='Tekky',
     author_email='<support@g4f.ai>',
     description=DESCRIPTION,
@@ -27,10 +95,11 @@ setup(
     long_description=long_description,
     packages=find_packages(),
     package_data={
-        'g4f': ['g4f/interference/*', 'g4f/gui/client/*', 'g4f/gui/server/*', 'g4f/Provider/npm/*']
+        'g4f': ['g4f/interference/*', 'g4f/gui/client/*', 'g4f/gui/server/*', 'g4f/Provider/npm/*', 'g4f/local/models/*']
     },
     include_package_data=True,
-    install_requires=required,
+    install_requires=INSTALL_REQUIRE,
+    extras_require=EXTRA_REQUIRE,
     entry_points={
         'console_scripts': ['g4f=g4f.cli:main'],
     },

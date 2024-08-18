@@ -1,506 +1,524 @@
 from __future__ import annotations
 
-import string
 import random
 import json
-import os
-import re
-import io
-import base64
-import numpy as np
 import uuid
-import urllib.parse
 import time
-from PIL import Image
-from aiohttp        import ClientSession, ClientTimeout
-from ..typing       import AsyncResult, Messages
-from .base_provider import AsyncGeneratorProvider
+import asyncio
+from urllib import parse
+from datetime import datetime, date
 
-class Tones():
+from ..typing import AsyncResult, Messages, ImageType, Cookies
+from ..image import ImageRequest
+from ..errors import ResponseError, ResponseStatusError, RateLimitError
+from ..requests import DEFAULT_HEADERS
+from ..requests.aiohttp import StreamSession
+from .base_provider import AsyncGeneratorProvider, ProviderModelMixin
+from .helper import get_random_hex
+from .bing.upload_image import upload_image
+from .bing.conversation import Conversation, create_conversation, delete_conversation
+from .BingCreateImages import BingCreateImages
+from .. import debug
+
+class Tones:
+    """
+    Defines the different tone options for the Bing provider.
+    """
     creative = "Creative"
     balanced = "Balanced"
     precise = "Precise"
+    copilot = "Copilot"
 
-default_cookies = {
-    'SRCHD'         : 'AF=NOFORM',
-    'PPLState'      : '1',
-    'KievRPSSecAuth': '',
-    'SUID'          : '',
-    'SRCHUSR'       : '',
-    'SRCHHPGUSR'    : f'HV={int(time.time())}',
-}
-
-class Bing(AsyncGeneratorProvider):
+class Bing(AsyncGeneratorProvider, ProviderModelMixin):
+    """
+    Bing provider for generating responses using the Bing API.
+    """
+    label = "Microsoft Copilot in Bing"
     url = "https://bing.com/chat"
     working = True
     supports_message_history = True
     supports_gpt_4 = True
-        
-    @staticmethod
+    default_model = "Balanced"
+    default_vision_model = "gpt-4-vision"
+    models = [getattr(Tones, key) for key in Tones.__dict__ if not key.startswith("__")]
+
+    @classmethod
     def create_async_generator(
+        cls,
         model: str,
         messages: Messages,
         proxy: str = None,
-        cookies: dict = None,
-        tone: str = Tones.creative,
-        image: str = None,
+        timeout: int = 900,
+        api_key: str = None,
+        cookies: Cookies = None,
+        tone: str = None,
+        image: ImageType = None,
         web_search: bool = False,
+        context: str = None,
         **kwargs
     ) -> AsyncResult:
-        if len(messages) < 2:
-            prompt = messages[0]["content"]
-            context = None
-        else:
-            prompt = messages[-1]["content"]
-            context = create_context(messages[:-1])
-        
-        if not cookies:
-            cookies = default_cookies
-        else:
-            for key, value in default_cookies.items():
-                if key not in cookies:
-                    cookies[key] = value
+        """
+        Creates an asynchronous generator for producing responses from Bing.
 
+        :param model: The model to use.
+        :param messages: Messages to process.
+        :param proxy: Proxy to use for requests.
+        :param timeout: Timeout for requests.
+        :param cookies: Cookies for the session.
+        :param tone: The tone of the response.
+        :param image: The image type to be used.
+        :param web_search: Flag to enable or disable web search.
+        :return: An asynchronous result object.
+        """
+        prompt = messages[-1]["content"]
+        if context is None:
+            context = create_context(messages[:-1]) if len(messages) > 1 else None
+        if tone is None:
+            tone = tone if model.startswith("gpt-4") else model
+        tone = cls.get_model("" if tone is None else tone)
         gpt4_turbo = True if model.startswith("gpt-4-turbo") else False
 
-        return stream_generate(prompt, tone, image, context, proxy, cookies, web_search, gpt4_turbo)
+        return stream_generate(
+            prompt, tone, image, context, cookies, api_key,
+            proxy, web_search, gpt4_turbo, timeout,
+            **kwargs
+        )
 
-def create_context(messages: Messages):
+def create_context(messages: Messages) -> str:
+    """
+    Creates a context string from a list of messages.
+
+    :param messages: A list of message dictionaries.
+    :return: A string representing the context created from the messages.
+    """
     return "".join(
-        f"[{message['role']}]" + ("(#message)" if message['role']!="system" else "(#additional_instructions)") + f"\n{message['content']}\n\n"
+        f"[{message['role']}]" + ("(#message)"
+        if message['role'] != "system"
+        else "(#additional_instructions)") + f"\n{message['content']}"
         for message in messages
-    )
+    ) + "\n\n"
 
-class Conversation():
-    def __init__(self, conversationId: str, clientId: str, conversationSignature: str, imageInfo: dict=None) -> None:
-        self.conversationId = conversationId
-        self.clientId = clientId
-        self.conversationSignature = conversationSignature
-        self.imageInfo = imageInfo
+def get_ip_address() -> str:
+    return f"13.{random.randint(104, 107)}.{random.randint(0, 255)}.{random.randint(0, 255)}"
 
-async def create_conversation(session: ClientSession, tone: str, image: str = None, proxy: str = None) -> Conversation:
-    url = 'https://www.bing.com/turing/conversation/create?bundleVersion=1.1199.4'
-    async with session.get(url, proxy=proxy) as response:
-        data = await response.json()
-
-        conversationId = data.get('conversationId')
-        clientId = data.get('clientId')
-        conversationSignature = response.headers.get('X-Sydney-Encryptedconversationsignature')
-
-        if not conversationId or not clientId or not conversationSignature:
-            raise Exception('Failed to create conversation.')
-        conversation = Conversation(conversationId, clientId, conversationSignature, None)
-        if isinstance(image,str):
-            try:
-                config = {
-                    "visualSearch": {
-                        "maxImagePixels": 360000,
-                        "imageCompressionRate": 0.7,
-                        "enableFaceBlurDebug": 0,
-                    }
-                }
-                is_data_uri_an_image(image)
-                img_binary_data = extract_data_uri(image)
-                is_accepted_format(img_binary_data)
-                img = Image.open(io.BytesIO(img_binary_data))
-                width, height = img.size
-                max_image_pixels = config['visualSearch']['maxImagePixels']
-                compression_rate = config['visualSearch']['imageCompressionRate']
-
-                if max_image_pixels / (width * height) < 1:
-                    new_width = int(width * np.sqrt(max_image_pixels / (width * height)))
-                    new_height = int(height * np.sqrt(max_image_pixels / (width * height)))
-                else:
-                    new_width = width
-                    new_height = height
-                try:
-                    orientation = get_orientation(img)
-                except Exception:
-                    orientation = None
-                new_img = process_image(orientation, img, new_width, new_height)
-                new_img_binary_data = compress_image_to_base64(new_img, compression_rate)
-                data, boundary = build_image_upload_api_payload(new_img_binary_data, conversation, tone)
-                headers = session.headers.copy()
-                headers["content-type"] = f'multipart/form-data; boundary={boundary}'
-                headers["referer"] = 'https://www.bing.com/search?q=Bing+AI&showconv=1&FORM=hpcodx'
-                headers["origin"] = 'https://www.bing.com'
-                async with session.post("https://www.bing.com/images/kblob", data=data, headers=headers, proxy=proxy) as image_upload_response:
-                    if image_upload_response.status != 200:
-                        raise Exception("Failed to upload image.")
-
-                    image_info = await image_upload_response.json()
-                    if not image_info.get('blobId'):
-                        raise Exception("Failed to parse image info.")
-                    result = {'bcid': image_info.get('blobId', "")}
-                    result['blurredBcid'] = image_info.get('processedBlobId', "")
-                    if result['blurredBcid'] != "":
-                        result["imageUrl"] = "https://www.bing.com/images/blob?bcid=" + result['blurredBcid']
-                    elif result['bcid'] != "":
-                        result["imageUrl"] = "https://www.bing.com/images/blob?bcid=" + result['bcid']
-                    result['originalImageUrl'] = (
-                        "https://www.bing.com/images/blob?bcid="
-                        + result['blurredBcid']
-                        if config['visualSearch']["enableFaceBlurDebug"]
-                        else "https://www.bing.com/images/blob?bcid="
-                        + result['bcid']
-                    )
-                    conversation.imageInfo = result
-            except Exception as e:
-                print(f"An error happened while trying to send image: {str(e)}")
-        return conversation
-
-async def list_conversations(session: ClientSession) -> list:
-    url = "https://www.bing.com/turing/conversation/chats"
-    async with session.get(url) as response:
-        response = await response.json()
-        return response["chats"]
-        
-async def delete_conversation(session: ClientSession, conversation: Conversation, proxy: str = None) -> list:
-    url = "https://sydney.bing.com/sydney/DeleteSingleConversation"
-    json = {
-        "conversationId": conversation.conversationId,
-        "conversationSignature": conversation.conversationSignature,
-        "participant": {"id": conversation.clientId},
-        "source": "cib",
-        "optionsSets": ["autosave"]
+def get_default_cookies():
+    #muid = get_random_hex().upper()
+    sid = get_random_hex().upper()
+    guid = get_random_hex().upper()
+    isodate = date.today().isoformat()
+    timestamp = int(time.time())
+    zdate = "0001-01-01T00:00:00.0000000"
+    return {
+        "_C_Auth": "",
+        #"MUID": muid,
+        #"MUIDB":  muid,
+        "_EDGE_S": f"F=1&SID={sid}",
+        "_EDGE_V": "1",
+        "SRCHD": "AF=hpcodx",
+        "SRCHUID": f"V=2&GUID={guid}&dmnchg=1",
+        "_RwBf": (
+            f"r=0&ilt=1&ihpd=0&ispd=0&rc=3&rb=0&gb=0&rg=200&pc=0&mtu=0&rbb=0&g=0&cid="
+            f"&clo=0&v=1&l={isodate}&lft={zdate}&aof=0&ard={zdate}"
+            f"&rwdbt={zdate}&rwflt={zdate}&o=2&p=&c=&t=0&s={zdate}"
+            f"&ts={isodate}&rwred=0&wls=&wlb="
+            "&wle=&ccp=&cpt=&lka=0&lkt=0&aad=0&TH="
+        ),
+        '_Rwho': f'u=d&ts={isodate}',
+        "_SS": f"SID={sid}&R=3&RB=0&GB=0&RG=200&RP=0",
+        "SRCHUSR": f"DOB={date.today().strftime('%Y%m%d')}&T={timestamp}",
+        "SRCHHPGUSR": f"HV={int(time.time())}",
+        "BCP": "AD=1&AL=1&SM=1",
+        "ipv6": f"hit={timestamp}",
+        '_C_ETH' : '1',
     }
-    async with session.post(url, json=json, proxy=proxy) as response:
-        try:
-            response = await response.json()
-            return response["result"]["value"] == "Success"
-        except:
-            return False
+
+async def create_headers(cookies: Cookies = None, api_key: str = None) -> dict:
+    if cookies is None:
+        # import nodriver as uc
+        # browser = await uc.start(headless=False)
+        # page = await browser.get(Defaults.home)
+        # await asyncio.sleep(10)
+        # cookies = {}
+        # for c in await page.browser.cookies.get_all():
+        #     if c.domain.endswith(".bing.com"):
+        #         cookies[c.name] = c.value
+        # user_agent = await page.evaluate("window.navigator.userAgent")
+        # await page.close()
+        cookies = get_default_cookies()
+    if api_key is not None:
+        cookies["_U"] = api_key
+    headers = Defaults.headers.copy()
+    headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    return headers
 
 class Defaults:
+    """
+    Default settings and configurations for the Bing provider.
+    """
     delimiter = "\x1e"
-    ip_address = f"13.{random.randint(104, 107)}.{random.randint(0, 255)}.{random.randint(0, 255)}"
 
+    # List of allowed message types for Bing responses
     allowedMessageTypes = [
-        "ActionRequest",
-        "Chat",
-        "Context",
-        # "Disengaged", unwanted
-        "Progress",
-        # "AdsQuery", unwanted
-        "SemanticSerp",
-        "GenerateContentQuery",
-        "SearchQuery",
-        # The following message types should not be added so that it does not flood with
-        # useless messages (such as "Analyzing images" or "Searching the web") while it's retrieving the AI response
-        # "InternalSearchQuery",
-        # "InternalSearchResult",
-        "RenderCardRequest",
-        # "RenderContentRequest"
+        "ActionRequest","Chat",
+        "ConfirmationCard", "Context",
+        "InternalSearchQuery", #"InternalSearchResult",
+        #"Disengaged", "InternalLoaderMessage",
+        "Progress", "RenderCardRequest",
+        "RenderContentRequest", "AdsQuery",
+        "SemanticSerp", "GenerateContentQuery",
+        "SearchQuery", "GeneratedCode",
+        "InternalTasksMessage"
     ]
 
-    sliceIds = [
-        'abv2',
-        'srdicton',
-        'convcssclick',
-        'stylewv2',
-        'contctxp2tf',
-        '802fluxv1pc_a',
-        '806log2sphs0',
-        '727savemem',
-        '277teditgnds0',
-        '207hlthgrds0',
-    ]
+    sliceIds = {
+        "balanced": [
+            "supllmnfe","archnewtf",
+            "stpstream", "stpsig", "vnextvoicecf", "scmcbase", "cmcpupsalltf", "sydtransctrl",
+            "thdnsrch", "220dcl1s0", "0215wcrwips0", "0305hrthrots0", "0130gpt4t",
+            "bingfc", "0225unsticky1", "0228scss0",
+            "defquerycf", "defcontrol", "3022tphpv"
+        ],
+        "creative": [
+            "bgstream", "fltltst2c",
+            "stpstream", "stpsig", "vnextvoicecf", "cmcpupsalltf", "sydtransctrl",
+            "0301techgnd", "220dcl1bt15", "0215wcrwip", "0305hrthrot", "0130gpt4t",
+            "bingfccf", "0225unsticky1", "0228scss0",
+            "3022tpvs0"
+        ],
+        "precise": [
+            "bgstream", "fltltst2c",
+            "stpstream", "stpsig", "vnextvoicecf", "cmcpupsalltf", "sydtransctrl",
+            "0301techgnd", "220dcl1bt15", "0215wcrwip", "0305hrthrot", "0130gpt4t",
+            "bingfccf", "0225unsticky1", "0228scss0",
+            "defquerycf", "3022tpvs0"
+        ],
+        "copilot": []
+    }
 
-    location = {
-        "locale": "en-US",
-        "market": "en-US",
-        "region": "US",
-        "locationHints": [
-            {
-                "country": "United States",
-                "state": "California",
-                "city": "Los Angeles",
-                "timezoneoffset": 8,
-                "countryConfidence": 8,
-                "Center": {"Latitude": 34.0536909, "Longitude": -118.242766},
-                "RegionType": 2,
-                "SourceType": 1,
-            }
+    optionsSets = {
+        "balanced": {
+            "default": [
+                "nlu_direct_response_filter", "deepleo",
+                "disable_emoji_spoken_text", "responsible_ai_policy_235",
+                "enablemm", "dv3sugg", "autosave",
+                "iyxapbing", "iycapbing",
+                "galileo", "saharagenconv5", "gldcl1p",
+                "gpt4tmncnp"
+            ],
+            "nosearch": [
+                "nlu_direct_response_filter", "deepleo",
+                "disable_emoji_spoken_text", "responsible_ai_policy_235",
+                "enablemm", "dv3sugg", "autosave",
+                "iyxapbing", "iycapbing",
+                "galileo", "sunoupsell", "base64filter", "uprv4p1upd",
+                "hourthrot", "noctprf", "gndlogcf", "nosearchall"
+            ]
+        },
+        "creative": {
+            "default": [
+                "nlu_direct_response_filter", "deepleo",
+                "disable_emoji_spoken_text", "responsible_ai_policy_235",
+                "enablemm", "dv3sugg",
+                "iyxapbing", "iycapbing",
+                "h3imaginative", "techinstgnd", "hourthrot", "clgalileo", "gencontentv3",
+                "gpt4tmncnp"
+            ],
+            "nosearch": [
+                "nlu_direct_response_filter", "deepleo",
+                "disable_emoji_spoken_text", "responsible_ai_policy_235",
+                "enablemm", "dv3sugg", "autosave",
+                "iyxapbing", "iycapbing",
+                "h3imaginative", "sunoupsell", "base64filter", "uprv4p1upd",
+                "hourthrot", "noctprf", "gndlogcf", "nosearchall",
+                "clgalileo", "nocache", "up4rp14bstcst"
+            ]
+        },
+        "precise": {
+            "default": [
+                "nlu_direct_response_filter", "deepleo",
+                "disable_emoji_spoken_text", "responsible_ai_policy_235",
+                "enablemm", "dv3sugg",
+                "iyxapbing", "iycapbing",
+                "h3precise", "techinstgnd", "hourthrot", "techinstgnd", "hourthrot",
+                "clgalileo", "gencontentv3"
+            ],
+            "nosearch": [
+                "nlu_direct_response_filter", "deepleo",
+                "disable_emoji_spoken_text", "responsible_ai_policy_235",
+                "enablemm", "dv3sugg", "autosave",
+                "iyxapbing", "iycapbing",
+                "h3precise", "sunoupsell", "base64filter", "uprv4p1upd",
+                "hourthrot", "noctprf", "gndlogcf", "nosearchall",
+                "clgalileo", "nocache", "up4rp14bstcst"
+            ]
+        },
+        "copilot": [
+            "nlu_direct_response_filter", "deepleo",
+            "disable_emoji_spoken_text", "responsible_ai_policy_235",
+            "enablemm", "dv3sugg",
+            "iyxapbing", "iycapbing",
+            "h3precise", "clgalileo", "gencontentv3", "prjupy"
         ],
     }
 
-    headers = {
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9',
-        'cache-control': 'max-age=0',
-        'sec-ch-ua': '"Chromium";v="110", "Not A(Brand";v="24", "Microsoft Edge";v="110"',
-        'sec-ch-ua-arch': '"x86"',
-        'sec-ch-ua-bitness': '"64"',
-        'sec-ch-ua-full-version': '"110.0.1587.69"',
-        'sec-ch-ua-full-version-list': '"Chromium";v="110.0.5481.192", "Not A(Brand";v="24.0.0.0", "Microsoft Edge";v="110.0.1587.69"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-model': '""',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-ch-ua-platform-version': '"15.0.0"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
-        'upgrade-insecure-requests': '1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36 Edg/110.0.1587.69',
-        'x-edge-shopping-flag': '1',
-        'x-forwarded-for': ip_address,
+    # Default location settings
+    location = {
+        "locale": "en-US", "market": "en-US", "region": "US",
+        "location":"lat:34.0536909;long:-118.242766;re=1000m;",
+        "locationHints": [{
+            "country": "United States", "state": "California", "city": "Los Angeles",
+            "timezoneoffset": 8, "countryConfidence": 8,
+            "Center": {"Latitude": 34.0536909, "Longitude": -118.242766},
+            "RegionType": 2, "SourceType": 1
+        }],
     }
 
-    optionsSets = [
-        'nlu_direct_response_filter',
-        'deepleo',
-        'disable_emoji_spoken_text',
-        'responsible_ai_policy_235',
-        'enablemm',
-        'iyxapbing',
-        'iycapbing',
-        'gencontentv3',
-        'fluxsrtrunc',
-        'fluxtrunc',
-        'fluxv1',
-        'rai278',
-        'replaceurl',
-        'eredirecturl',
-        'nojbfedge'
-    ]
+    # Default headers for requests
+    home = "https://www.bing.com/chat?q=Microsoft+Copilot&FORM=hpcodx"
+    headers = {
+        **DEFAULT_HEADERS,
+        "accept": "application/json",
+        "referer": home,
+        "x-ms-client-request-id": str(uuid.uuid4()),
+        "x-ms-useragent": "azsdk-js-api-client-factory/1.0.0-beta.1 core-rest-pipeline/1.15.1 OS/Windows",
+    }
 
 def format_message(msg: dict) -> str:
+    """
+    Formats a message dictionary into a JSON string with a delimiter.
+
+    :param msg: The message dictionary to format.
+    :return: A formatted string representation of the message.
+    """
     return json.dumps(msg, ensure_ascii=False) + Defaults.delimiter
 
-def build_image_upload_api_payload(image_bin: str, conversation: Conversation, tone: str):
-    payload = {
-        'invokedSkills': ["ImageById"],
-        'subscriptionId': "Bing.Chat.Multimodal",
-        'invokedSkillsRequestData': {
-            'enableFaceBlur': True
-        },
-        'convoData': {
-            'convoid': "",
-            'convotone': tone
-        }
-    }
-    knowledge_request = {
-        'imageInfo': {},
-        'knowledgeRequest': payload
-    }
-    boundary="----WebKitFormBoundary" + ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-    data = (
-        f'--{boundary}'
-        + '\r\nContent-Disposition: form-data; name="knowledgeRequest"\r\n\r\n'
-        + json.dumps(knowledge_request, ensure_ascii=False)
-        + "\r\n--"
-        + boundary
-        + '\r\nContent-Disposition: form-data; name="imageBase64"\r\n\r\n'
-        + image_bin
-        + "\r\n--"
-        + boundary
-        + "--\r\n"
-    )
-    return data, boundary
+def create_message(
+    conversation: Conversation,
+    prompt: str,
+    tone: str,
+    context: str = None,
+    image_request: ImageRequest = None,
+    web_search: bool = False,
+    gpt4_turbo: bool = False,
+    new_conversation: bool = True
+) -> str:
+    """
+    Creates a message for the Bing API with specified parameters.
 
-def is_data_uri_an_image(data_uri: str):
-    try:
-        # Check if the data URI starts with 'data:image' and contains an image format (e.g., jpeg, png, gif)
-        if not re.match(r'data:image/(\w+);base64,', data_uri):
-            raise ValueError("Invalid data URI image.")
-            # Extract the image format from the data URI
-        image_format = re.match(r'data:image/(\w+);base64,', data_uri).group(1)
-        # Check if the image format is one of the allowed formats (jpg, jpeg, png, gif)
-        if image_format.lower() not in ['jpeg', 'jpg', 'png', 'gif']:
-            raise ValueError("Invalid image format (from mime file type).")
-    except Exception as e:
-        raise e
+    :param conversation: The current conversation object.
+    :param prompt: The user's input prompt.
+    :param tone: The desired tone for the response.
+    :param context: Additional context for the prompt.
+    :param image_request: The image request with the url.
+    :param web_search: Flag to enable web search.
+    :param gpt4_turbo: Flag to enable GPT-4 Turbo.
+    :return: A formatted string message for the Bing API.
+    """
 
-def is_accepted_format(binary_data: bytes) -> bool:
-        try:
-            check = False
-            if binary_data.startswith(b'\xFF\xD8\xFF'):
-                check = True  # It's a JPEG image
-            elif binary_data.startswith(b'\x89PNG\r\n\x1a\n'):
-                check = True  # It's a PNG image
-            elif binary_data.startswith(b'GIF87a') or binary_data.startswith(b'GIF89a'):
-                check = True  # It's a GIF image
-            elif binary_data.startswith(b'\x89JFIF') or binary_data.startswith(b'JFIF\x00'):
-                check = True  # It's a JPEG image
-            elif binary_data.startswith(b'\xFF\xD8'):
-                check = True  # It's a JPEG image
-            elif binary_data.startswith(b'RIFF') and binary_data[8:12] == b'WEBP':
-                check = True  # It's a WebP image
-            # else we raise ValueError
-            if not check:
-                raise ValueError("Invalid image format (from magic code).")
-        except Exception as e:
-            raise e
-    
-def extract_data_uri(data_uri: str) -> bytes:
-    try:
-        data = data_uri.split(",")[1]
-        data = base64.b64decode(data)
-        return data
-    except Exception as e:
-        raise e
-
-def get_orientation(data: bytes) -> int:
-    try:
-        if data[:2] != b'\xFF\xD8':
-            raise Exception('NotJpeg')
-        with Image.open(data) as img:
-            exif_data = img._getexif()
-            if exif_data is not None:
-                orientation = exif_data.get(274)  # 274 corresponds to the orientation tag in EXIF
-                if orientation is not None:
-                    return orientation
-    except Exception:
-        pass
-
-def process_image(orientation: int, img: Image.Image, new_width: int, new_height: int) -> Image.Image:
-    try:
-        # Initialize the canvas
-        new_img = Image.new("RGB", (new_width, new_height), color="#FFFFFF")
-        if orientation:
-            if orientation > 4:
-                img = img.transpose(Image.FLIP_LEFT_RIGHT)
-            if orientation in [3, 4]:
-                img = img.transpose(Image.ROTATE_180)
-            if orientation in [5, 6]:
-                img = img.transpose(Image.ROTATE_270)
-            if orientation in [7, 8]:
-                img = img.transpose(Image.ROTATE_90)
-        new_img.paste(img, (0, 0))
-        return new_img
-    except Exception as e:
-        raise e
-    
-def compress_image_to_base64(img, compression_rate) -> str:
-    try:
-        output_buffer = io.BytesIO()
-        img.save(output_buffer, format="JPEG", quality=int(compression_rate * 100))
-        return base64.b64encode(output_buffer.getvalue()).decode('utf-8')
-    except Exception as e:
-        raise e
-
-def create_message(conversation: Conversation, prompt: str, tone: str, context: str = None, web_search: bool = False, gpt4_turbo: bool = False) -> str:
-    options_sets = Defaults.optionsSets
-    if tone == Tones.creative:
-        options_sets.append("h3imaginative")
-    elif tone == Tones.precise:
-        options_sets.append("h3precise")
-    elif tone == Tones.balanced:
-        options_sets.append("galileo")
-    else:
-        options_sets.append("harmonyv3")
-        
-    if not web_search:
-        options_sets.append("nosearchall")
-
+    options_sets = Defaults.optionsSets[tone.lower()]
+    if not web_search and "nosearch" in options_sets:
+        options_sets = options_sets["nosearch"]
+    elif "default" in options_sets:
+        options_sets = options_sets["default"]
+    options_sets = options_sets.copy()
     if gpt4_turbo:
         options_sets.append("dlgpt4t")
-    
+
     request_id = str(uuid.uuid4())
     struct = {
-        'arguments': [
-            {
-                'source': 'cib',
-                'optionsSets': options_sets,
-                'allowedMessageTypes': Defaults.allowedMessageTypes,
-                'sliceIds': Defaults.sliceIds,
-                'traceId': os.urandom(16).hex(),
-                'isStartOfSession': True,
-                'requestId': request_id,
-                'message': {**Defaults.location, **{
-                    'author': 'user',
-                    'inputMethod': 'Keyboard',
-                    'text': prompt,
-                    'messageType': 'Chat',
-                    'requestId': request_id,
-                    'messageId': request_id,
-                }},
-                "scenario": "SERP",
-                'tone': tone,
-                'spokenTextMode': 'None',
-                'conversationId': conversation.conversationId,
-                'participant': {
-                    'id': conversation.clientId
-                },
-            }
-        ],
-        'invocationId': '1',
-        'target': 'chat',
-        'type': 4
+        "arguments":[{
+            "source": "cib",
+            "optionsSets": options_sets,
+            "allowedMessageTypes": Defaults.allowedMessageTypes,
+            "sliceIds": Defaults.sliceIds[tone.lower()],
+            "verbosity": "verbose",
+            "scenario": "CopilotMicrosoftCom" if tone == Tones.copilot else "SERP",
+            "plugins": [{"id": "c310c353-b9f0-4d76-ab0d-1dd5e979cf68", "category": 1}] if web_search else [],
+            "traceId": get_random_hex(40),
+            "conversationHistoryOptionsSets": ["autosave","savemem","uprofupd","uprofgen"],
+            "gptId": "copilot",
+            "isStartOfSession": new_conversation,
+            "requestId": request_id,
+            "message":{
+                **Defaults.location,
+                "userIpAddress": get_ip_address(),
+                "timestamp": datetime.now().isoformat(),
+                "author": "user",
+                "inputMethod": "Keyboard",
+                "text": prompt,
+                "messageType": "Chat",
+                "requestId": request_id,
+                "messageId": request_id
+            },
+            "tone": "Balanced" if tone == Tones.copilot else tone,
+            "spokenTextMode": "None",
+            "conversationId": conversation.conversationId,
+            "participant": {"id": conversation.clientId}
+        }],
+        "invocationId": "0",
+        "target": "chat",
+        "type": 4
     }
-    if conversation.imageInfo != None and "imageUrl" in conversation.imageInfo and "originalImageUrl" in conversation.imageInfo:
-        struct['arguments'][0]['message']['originalImageUrl'] = conversation.imageInfo['originalImageUrl']
-        struct['arguments'][0]['message']['imageUrl'] = conversation.imageInfo['imageUrl']
+
+    if image_request and image_request.get('imageUrl') and image_request.get('originalImageUrl'):
+        struct['arguments'][0]['message']['originalImageUrl'] = image_request.get('originalImageUrl')
+        struct['arguments'][0]['message']['imageUrl'] = image_request.get('imageUrl')
         struct['arguments'][0]['experienceType'] = None
         struct['arguments'][0]['attachedFileInfo'] = {"fileName": None, "fileType": None}
+
     if context:
         struct['arguments'][0]['previousMessages'] = [{
             "author": "user",
             "description": context,
-            "contextType": "WebPage",
+            "contextType": "ClientApp",
             "messageType": "Context",
             "messageId": "discover-web--page-ping-mriduna-----"
         }]
+
     return format_message(struct)
 
 async def stream_generate(
-        prompt: str,
-        tone: str,
-        image: str = None,
-        context: str = None,
-        proxy: str = None,
-        cookies: dict = None,
-        web_search: bool = False,
-        gpt4_turbo: bool = False
-    ):
-    async with ClientSession(
-            timeout=ClientTimeout(total=900),
-            headers=Defaults.headers if not cookies else {**Defaults.headers, "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())},
-        ) as session:
-        conversation = await create_conversation(session, tone, image, proxy)
-        try:
-            async with session.ws_connect('wss://sydney.bing.com/sydney/ChatHub', autoping=False, params={'sec_access_token': conversation.conversationSignature}, proxy=proxy) as wss:
+    prompt: str,
+    tone: str,
+    image: ImageType = None,
+    context: str = None,
+    cookies: dict = None,
+    api_key: str = None,
+    proxy: str = None,
+    web_search: bool = False,
+    gpt4_turbo: bool = False,
+    timeout: int = 900,
+    conversation: Conversation = None,
+    return_conversation: bool = False,
+    raise_apology: bool = False,
+    max_retries: int = None,
+    sleep_retry: int = 15,
+    **kwargs
+):
+    """
+    Asynchronously streams generated responses from the Bing API.
 
+    :param prompt: The user's input prompt.
+    :param tone: The desired tone for the response.
+    :param image: The image type involved in the response.
+    :param context: Additional context for the prompt.
+    :param cookies: Cookies for the session.
+    :param web_search: Flag to enable web search.
+    :param gpt4_turbo: Flag to enable GPT-4 Turbo.
+    :param timeout: Timeout for the request.
+    :return: An asynchronous generator yielding responses.
+    """
+    headers = await create_headers(cookies, api_key)
+    new_conversation = conversation is None
+    max_retries = (5 if new_conversation else 0) if max_retries is None else max_retries
+    first = True
+    while first or conversation is None:
+        async with StreamSession(timeout=timeout, proxy=proxy) as session:
+            first = False
+            do_read = True
+            try:
+                if conversation is None:
+                    conversation = await create_conversation(session, headers, tone)
+                if return_conversation:
+                    yield conversation
+            except (ResponseStatusError, RateLimitError) as e:
+                max_retries -= 1
+                if max_retries < 1:
+                    raise e
+                if debug.logging:
+                    print(f"Bing: Retry: {e}")
+                headers = await create_headers()
+                await asyncio.sleep(sleep_retry)
+                continue
+
+            image_request = await upload_image(
+                session,
+                image,
+                "Balanced" if tone == Tones.copilot else tone,
+                headers
+            ) if image else None
+            async with session.ws_connect(
+                'wss://s.copilot.microsoft.com/sydney/ChatHub'
+                if tone == "Copilot" else
+                'wss://sydney.bing.com/sydney/ChatHub',
+                autoping=False,
+                params={'sec_access_token': conversation.conversationSignature},
+                headers=headers
+            ) as wss:
                 await wss.send_str(format_message({'protocol': 'json', 'version': 1}))
-                await wss.receive(timeout=900)
-                await wss.send_str(create_message(conversation, prompt, tone, context, web_search, gpt4_turbo))
-
+                await wss.send_str(format_message({"type": 6}))
+                await wss.receive_str()
+                await wss.send_str(create_message(
+                    conversation, prompt, tone,
+                    context if new_conversation else None,
+                    image_request, web_search, gpt4_turbo,
+                    new_conversation
+                ))
                 response_txt = ''
                 returned_text = ''
-                final = False
-                while not final:
-                    msg = await wss.receive(timeout=900)
-                    objects = msg.data.split(Defaults.delimiter)
+                message_id = None
+                while do_read:
+                    try:
+                        msg = await wss.receive_str()
+                    except TypeError:
+                        continue
+                    objects = msg.split(Defaults.delimiter)
                     for obj in objects:
-                        if obj is None or not obj:
+                        if not obj:
                             continue
-
-                        response = json.loads(obj)
-                        if response.get('type') == 1 and response['arguments'][0].get('messages'):
+                        try:
+                            response = json.loads(obj)
+                        except ValueError:
+                            continue
+                        if response and response.get('type') == 1 and response['arguments'][0].get('messages'):
                             message = response['arguments'][0]['messages'][0]
-                            if (message['contentOrigin'] != 'Apology'):
-                                if 'adaptiveCards' in message:
-                                    card = message['adaptiveCards'][0]['body'][0]
-                                    if "text" in card:
-                                        response_txt = card.get('text')
-                                    if message.get('messageType'):
-                                        inline_txt = card['inlines'][0].get('text')
-                                        response_txt += inline_txt + '\n'
-                                elif message.get('contentType') == "IMAGE":
-                                    query = urllib.parse.quote(message.get('text'))
-                                    url = f"\nhttps://www.bing.com/images/create?q={query}"
-                                    response_txt += url
-                                    final = True
+                            if message_id is not None and message_id != message["messageId"]:
+                                returned_text = ''
+                            message_id = message["messageId"]
+                            image_response = None
+                            if (raise_apology and message['contentOrigin'] == 'Apology'):
+                                raise ResponseError("Apology Response Error")
+                            if 'adaptiveCards' in message:
+                                card = message['adaptiveCards'][0]['body'][0]
+                                if "text" in card:
+                                    response_txt = card.get('text')
+                                if message.get('messageType') and "inlines" in card:
+                                    inline_txt = card['inlines'][0].get('text')
+                                    response_txt += f"{inline_txt}\n"
+                            elif message.get('contentType') == "IMAGE":
+                                prompt = message.get('text')
+                                try:
+                                    image_client = BingCreateImages(cookies, proxy, api_key)
+                                    image_response = await image_client.create_async(prompt)
+                                except Exception as e:
+                                    if debug.logging:
+                                        print(f"Bing: Failed to create images: {e}")
+                                    image_response = f"\nhttps://www.bing.com/images/create?q={parse.quote(prompt)}"
                             if response_txt.startswith(returned_text):
                                 new = response_txt[len(returned_text):]
-                                if new != "\n":
+                                if new not in ("", "\n"):
                                     yield new
                                     returned_text = response_txt
+                            if image_response is not None:
+                                yield image_response
                         elif response.get('type') == 2:
                             result = response['item']['result']
+                            do_read = False
                             if result.get('error'):
-                                raise Exception(f"{result['value']}: {result['message']}")
-                            return
-        finally:
-            await delete_conversation(session, conversation, proxy)
+                                max_retries -= 1
+                                if max_retries < 1:
+                                    if result["value"] == "CaptchaChallenge":
+                                        raise RateLimitError(f"{result['value']}: Use other cookies or/and ip address")
+                                    else:
+                                        raise RuntimeError(f"{result['value']}: {result['message']}")
+                                if debug.logging:
+                                    print(f"Bing: Retry: {result['value']}: {result['message']}")
+                                headers = await create_headers()
+                                conversation = None
+                                await asyncio.sleep(sleep_retry)
+                            break
+                        elif response.get('type') == 3:
+                            do_read = False
+                            break
+            if conversation is not None:
+                await delete_conversation(session, conversation, headers)

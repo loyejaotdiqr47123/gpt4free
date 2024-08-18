@@ -1,57 +1,62 @@
 from __future__ import annotations
 
-from .base_provider  import BaseProvider, AsyncProvider, AsyncGeneratorProvider
-from .retry_provider import RetryProvider
-from .deprecated     import *
-from .needs_auth     import *
-from .unfinished     import *
-from .selenium       import *
-from .Aura            import Aura
-from .AiAsk           import AiAsk
-from .Aichat          import Aichat
-from .AiChatOnline    import AiChatOnline
-from .AItianhu        import AItianhu
-from .AItianhuSpace   import AItianhuSpace
-from .Berlin          import Berlin
-from .Bing            import Bing
-from .ChatAnywhere    import ChatAnywhere
-from .ChatBase        import ChatBase
-from .ChatForAi       import ChatForAi
-from .Chatgpt4Online  import Chatgpt4Online
-from .ChatgptAi       import ChatgptAi
-from .ChatgptDemo     import ChatgptDemo
-from .ChatgptDemoAi   import ChatgptDemoAi
-from .ChatgptFree     import ChatgptFree
-from .ChatgptLogin    import ChatgptLogin
-from .ChatgptNext     import ChatgptNext
-from .ChatgptX        import ChatgptX
-from .Chatxyz         import Chatxyz
-from .DeepInfra       import DeepInfra
-from .FakeGpt         import FakeGpt
-from .FreeGpt         import FreeGpt
-from .Gpt6            import Gpt6
-from .GPTalk          import GPTalk
-from .GptChatly       import GptChatly
-from .GptForLove      import GptForLove
-from .GptGo           import GptGo
-from .GptGod          import GptGod
-from .GptTalkRu       import GptTalkRu
-from .Hashnode        import Hashnode
-from .Koala           import Koala
-from .Liaobots        import Liaobots
-from .Llama2          import Llama2
-from .MyShell         import MyShell
-from .OnlineGpt       import OnlineGpt
-from .Opchatgpts      import Opchatgpts
-from .PerplexityAi    import PerplexityAi
-from .Phind           import Phind
-from .Pi              import Pi
-from .TalkAi          import TalkAi
-from .Vercel          import Vercel
-from .Ylokh           import Ylokh
-from .You             import You
-from .Yqcloud         import Yqcloud
-from .GeekGpt         import GeekGpt
+from ..providers.types          import BaseProvider, ProviderType
+from ..providers.retry_provider import RetryProvider, IterListProvider
+from ..providers.base_provider  import AsyncProvider, AsyncGeneratorProvider
+from ..providers.create_images  import CreateImagesProvider
+
+from .deprecated      import *
+from .not_working     import *
+from .selenium        import *
+from .needs_auth      import *
+
+from .AI365VIP         import AI365VIP
+from .Allyfy           import Allyfy
+from .Aura             import Aura
+from .Bing             import Bing
+from .BingCreateImages import BingCreateImages
+from .Blackbox         import Blackbox
+from .ChatGot          import ChatGot
+from .Chatgpt4o        import Chatgpt4o
+from .Chatgpt4Online   import Chatgpt4Online
+from .ChatgptFree      import ChatgptFree
+from .Cohere           import Cohere
+from .DDG              import DDG
+from .DeepInfra        import DeepInfra
+from .DeepInfraImage   import DeepInfraImage
+from .FlowGpt          import FlowGpt
+from .FreeChatgpt      import FreeChatgpt
+from .FreeGpt          import FreeGpt
+from .FreeNetfly       import FreeNetfly
+from .GeminiPro        import GeminiPro
+from .GeminiProChat    import GeminiProChat
+from .GigaChat         import GigaChat
+from .GptTalkRu        import GptTalkRu
+from .HuggingChat      import HuggingChat
+from .HuggingFace      import HuggingFace
+from .HuggingFace      import HuggingFace
+from .Koala            import Koala
+from .Liaobots         import Liaobots
+from .LiteIcoding      import LiteIcoding
+from .Llama            import Llama
+from .Local            import Local
+from .MagickPenAsk     import MagickPenAsk
+from .MagickPenChat    import MagickPenChat
+from .Marsyoo          import Marsyoo
+from .MetaAI           import MetaAI
+from .MetaAIAccount    import MetaAIAccount
+from .Ollama           import Ollama
+from .PerplexityLabs   import PerplexityLabs
+from .Pi               import Pi
+from .Pizzagpt         import Pizzagpt
+from .Reka             import Reka
+from .Replicate        import Replicate
+from .ReplicateHome    import ReplicateHome
+from .Rocks            import Rocks
+from .TeachAnything    import TeachAnything
+from .Vercel           import Vercel
+from .WhiteRabbitNeo   import WhiteRabbitNeo
+from .You              import You
 
 import sys
 
@@ -59,7 +64,7 @@ __modules__: list = [
     getattr(sys.modules[__name__], provider) for provider in dir()
     if not provider.startswith("__")
 ]
-__providers__: list[type[BaseProvider]] = [
+__providers__: list[ProviderType] = [
     provider for provider in __modules__
     if isinstance(provider, type)
     and issubclass(provider, BaseProvider)
@@ -67,9 +72,9 @@ __providers__: list[type[BaseProvider]] = [
 __all__: list[str] = [
     provider.__name__ for provider in __providers__
 ]
-__map__: dict[str, type[BaseProvider]] = dict([
+__map__: dict[str, ProviderType] = dict([
     (provider.__name__, provider) for provider in __providers__
 ])
 
 class ProviderUtils:
-    convert: dict[str, type[BaseProvider]] = __map__
+    convert: dict[str, ProviderType] = __map__

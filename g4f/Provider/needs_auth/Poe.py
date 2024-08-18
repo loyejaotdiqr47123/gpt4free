@@ -3,9 +3,9 @@ from __future__ import annotations
 import time
 
 from ...typing import CreateResult, Messages
-from ..base_provider import BaseProvider
+from ..base_provider import AbstractProvider
 from ..helper import format_prompt
-from ...webdriver import WebDriver, WebDriverSession
+from ...webdriver import WebDriver, WebDriverSession, element_send_text
 
 models = {
     "meta-llama/Llama-2-7b-chat-hf": {"name": "Llama-2-7b"},
@@ -20,7 +20,7 @@ models = {
     "palm": {"name": "Google-PaLM"},
 }
 
-class Poe(BaseProvider):
+class Poe(AbstractProvider):
     url = "https://poe.com"
     working = True
     needs_auth = True
@@ -89,7 +89,7 @@ class Poe(BaseProvider):
                 else:
                     raise RuntimeError("Prompt textarea not found. You may not be logged in.")
 
-            driver.find_element(By.CSS_SELECTOR, "footer textarea[class^='GrowingTextArea']").send_keys(prompt)
+            element_send_text(driver.find_element(By.CSS_SELECTOR, "footer textarea[class^='GrowingTextArea']"), prompt)
             driver.find_element(By.CSS_SELECTOR, "footer button[class*='ChatMessageSendButton']").click()
 
             script = """

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from bs4 import BeautifulSoup
 from aiohttp import ClientSession, ClientTimeout
-from duckduckgo_search import DDGS
+try:
+    from duckduckgo_search.duckduckgo_search_async import AsyncDDGS
+    from bs4 import BeautifulSoup
+    has_requirements = True
+except ImportError:
+    has_requirements = False
+from ...errors import MissingRequirementsError
+    
 import asyncio
 
 class SearchResults():
@@ -24,7 +30,10 @@ class SearchResults():
                 search += result.snippet
             search += f"\n\nSource: [[{idx}]]({result.url})"
         return search
-    
+
+    def __len__(self) -> int:
+        return len(self.results)
+
 class SearchResultEntry():
     def __init__(self, title: str, url: str, snippet: str, text: str = None):
         self.title = title
@@ -88,21 +97,22 @@ async def fetch_and_scrape(session: ClientSession, url: str, max_words: int = No
         return
 
 async def search(query: str, n_results: int = 5, max_words: int = 2500, add_text: bool = True) -> SearchResults:
-    with DDGS() as ddgs:
+    if not has_requirements:
+        raise MissingRequirementsError('Install "duckduckgo-search" and "beautifulsoup4" package')
+    async with AsyncDDGS() as ddgs:
         results = []
-        for result in ddgs.text(
+        for result in await ddgs.text(
                 query,
                 region="wt-wt",
                 safesearch="moderate",
                 timelimit="y",
+                max_results=n_results
             ):
             results.append(SearchResultEntry(
                 result["title"],
                 result["href"],
                 result["body"]
             ))
-            if len(results) >= n_results:
-                break
 
         if add_text:
             requests = []
@@ -112,7 +122,7 @@ async def search(query: str, n_results: int = 5, max_words: int = 2500, add_text
                 texts = await asyncio.gather(*requests)
 
         formatted_results = []
-        left_words = max_words;
+        left_words = max_words
         for i, entry in enumerate(results):
             if add_text:
                 entry.text = texts[i]
@@ -128,7 +138,6 @@ async def search(query: str, n_results: int = 5, max_words: int = 2500, add_text
 
         return SearchResults(formatted_results)
 
-
 def get_search_message(prompt) -> str:
     try:
         search_results = asyncio.run(search(prompt))
@@ -138,12 +147,11 @@ def get_search_message(prompt) -> str:
 
 Instruction: Using the provided web search results, to write a comprehensive reply to the user request.
 Make sure to add the sources of cites using [[Number]](Url) notation after the reference. Example: [[0]](http://google.com)
-If the provided search results refer to multiple subjects with the same name, write separate answers for each subject.
 
 User request:
 {prompt}
 """
         return message
     except Exception as e:
-        print("Couldn't search DuckDuckGo:", e)
+        print("Couldn't do web search:", e)
         return prompt
